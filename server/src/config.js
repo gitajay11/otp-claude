@@ -37,15 +37,33 @@ function resolveJwtSecret() {
 }
 
 const smtpPort = Number(env.SMTP_PORT) || 587;
+const onVercel = Boolean(env.VERCEL);
+
+function resolveDatabaseUrl() {
+  const url = env.DATABASE_URL?.trim();
+  if (!url) {
+    throw new Error('DATABASE_URL is not set. Add your Neon/Postgres connection string to server/.env (or the Vercel project settings).');
+  }
+  return url;
+}
 
 export const config = Object.freeze({
   env: env.NODE_ENV || 'development',
   isProd,
   appName: env.APP_NAME?.trim() || 'Nexus',
   port: Number(env.PORT) || 4000,
-  /** Value for Express' "trust proxy" setting (needed for correct client IPs behind a reverse proxy). */
-  trustProxy: env.TRUST_PROXY ? (/^\d+$/.test(env.TRUST_PROXY) ? Number(env.TRUST_PROXY) : env.TRUST_PROXY) : false,
-  dbPath: path.resolve(SERVER_ROOT, env.DB_PATH || 'data/nexus.db'),
+  /**
+   * Express "trust proxy" setting, needed for correct client IPs behind a
+   * reverse proxy. Defaults to 1 hop on Vercel (its edge sets X-Forwarded-For).
+   */
+  trustProxy: env.TRUST_PROXY
+    ? /^\d+$/.test(env.TRUST_PROXY)
+      ? Number(env.TRUST_PROXY)
+      : env.TRUST_PROXY
+    : onVercel
+      ? 1
+      : false,
+  databaseUrl: resolveDatabaseUrl(),
   clientDist: path.resolve(SERVER_ROOT, '..', 'client', 'dist'),
 
   jwt: Object.freeze({

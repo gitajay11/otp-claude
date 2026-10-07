@@ -10,41 +10,22 @@
  *    comparison so parallel requests cannot exceed the limit.
  *  - Issuing a new code invalidates any previous active code for that
  *    email + purpose.
- *  - Sends are rate-limited per email: 1 per cooldown window and N per hour.
+ *  - Sends are rate-limited per email (1 per cooldown, N per hour). The
+ *    check-and-record runs under a per-email advisory lock, so concurrent
+ *    requests — even on different serverless instances — can't slip through.
+ *
+ * All time comparisons use the database clock (now()) to avoid skew between
+ * function instances.
  */
 import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { config } from '../config.js';
-import { db, transaction } from '../db.js';
+import { sql } from '../db.js';
 import { HttpError } from '../utils/httpError.js';
 
 const { length, ttlMs, maxAttempts, resendCooldownMs, hourlyLimit, bcryptRounds } = config.otp;
-const HOUR_MS = 60 * 60 * 1000;
-
-const stmts = {
-  lastSend: db.prepare('SELECT MAX(sent_at) AS last FROM otp_sends WHERE email = ?'),
-  sendsSince: db.prepare('SELECT COUNT(*) AS count, MIN(sent_at) AS oldest FROM otp_sends WHERE email = ? AND sent_at > ?'),
-  logSend: db.prepare('INSERT INTO otp_sends (email, sent_at) VALUES (?, ?)'),
-  unlogSend: db.prepare('DELETE FROM otp_sends WHERE id = ?'),
-
-  invalidateActive: db.prepare(
-    'UPDATE otps SET consumed_at = ? WHERE email = ? AND purpose = ? AND consumed_at IS NULL',
-  ),
-  insertOtp: db.prepare(`
-    INSERT INTO otps (email, purpose, otp_hash, payload, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `),
-  activeOtp: db.prepare(`
-    SELECT * FROM otps
-    WHERE email = ? AND purpose = ? AND consumed_at IS NULL
-    ORDER BY id DESC LIMIT 1
-  `),
-  claimAttempt: db.prepare(
-    'UPDATE otps SET attempts = attempts + 1 WHERE id = ? AND attempts < ? AND consumed_at IS NULL',
-  ),
-  attemptsOf: db.prepare('SELECT attempts FROM otps WHERE id = ?'),
-  consume: db.prepare('UPDATE otps SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL'),
-};
+const cooldownSec = Math.round(resendCooldownMs / 1000);
+const ttlSec = Math.round(ttlMs / 1000);
 
 /** Uniformly random, zero-padded numeric code, e.g. "04821". */
 function generateCode() {
@@ -52,34 +33,49 @@ function generateCode() {
 }
 
 /**
- * Throws 429 if this email may not receive another code yet.
- * Otherwise records the send immediately (reserving the slot so concurrent
- * requests can't slip through) and returns the log row id.
+ * Atomically check the per-email limits and, if allowed, record the send
+ * (reserving the slot). Throws 429 otherwise. Returns the send-log row id.
  */
-function reserveSendSlot(email) {
-  const now = Date.now();
+async function reserveSendSlot(email) {
+  const [, [result]] = await sql.transaction([
+    // Serialise concurrent sends for the same email until this transaction commits.
+    sql`SELECT pg_advisory_xact_lock(hashtext(${email}))`,
+    sql`
+      WITH stats AS (
+        SELECT max(sent_at) AS last, min(sent_at) AS oldest, count(*)::int AS sends
+        FROM otp_sends
+        WHERE email = ${email} AND sent_at > now() - interval '1 hour'
+      ), inserted AS (
+        INSERT INTO otp_sends (email)
+        SELECT ${email} FROM stats
+        WHERE (last IS NULL OR last <= now() - make_interval(secs => ${cooldownSec}))
+          AND sends < ${hourlyLimit}
+        RETURNING id
+      )
+      SELECT
+        (SELECT id FROM inserted) AS id,
+        ceil(extract(epoch FROM (last + make_interval(secs => ${cooldownSec}) - now())))::int AS cooldown_left,
+        ceil(extract(epoch FROM (oldest + interval '1 hour' - now())))::int AS hour_left
+      FROM stats
+    `,
+  ]);
 
-  const { last } = stmts.lastSend.get(email);
-  if (last && now - last < resendCooldownMs) {
-    const retryAfterSec = Math.ceil((last + resendCooldownMs - now) / 1000);
+  if (result.id) return result.id;
+
+  if (result.cooldown_left > 0) {
+    const retryAfterSec = result.cooldown_left;
     throw new HttpError(429, 'OTP_COOLDOWN', `Please wait ${retryAfterSec}s before requesting another code.`, {
       retryAfterSec,
     });
   }
-
-  const { count, oldest } = stmts.sendsSince.get(email, now - HOUR_MS);
-  if (count >= hourlyLimit) {
-    const retryAfterSec = Math.ceil((oldest + HOUR_MS - now) / 1000);
-    const minutes = Math.ceil(retryAfterSec / 60);
-    throw new HttpError(
-      429,
-      'OTP_HOURLY_LIMIT',
-      `Too many codes requested. Try again in about ${minutes} minute${minutes === 1 ? '' : 's'}.`,
-      { retryAfterSec },
-    );
-  }
-
-  return stmts.logSend.run(email, now).lastInsertRowid;
+  const retryAfterSec = Math.max(1, result.hour_left);
+  const minutes = Math.ceil(retryAfterSec / 60);
+  throw new HttpError(
+    429,
+    'OTP_HOURLY_LIMIT',
+    `Too many codes requested. Try again in about ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+    { retryAfterSec },
+  );
 }
 
 /**
@@ -90,10 +86,10 @@ function reserveSendSlot(email) {
  * @param {'signup'|'login'} opts.purpose
  * @param {object}  [opts.payload] data to attach (e.g. pending sign-up details)
  * @param {(code: string) => Promise<void>} opts.deliver  sends the code (email)
- * @returns {{ expiresInSec: number, resendAfterSec: number }}
+ * @returns {Promise<{ expiresInSec: number, resendAfterSec: number }>}
  */
 export async function issueOtp({ email, purpose, payload = null, deliver }) {
-  const sendLogId = reserveSendSlot(email);
+  const sendLogId = await reserveSendSlot(email);
   const code = generateCode();
 
   let hash;
@@ -102,20 +98,23 @@ export async function issueOtp({ email, purpose, payload = null, deliver }) {
     await deliver(code);
   } catch (err) {
     // A failed delivery shouldn't burn the user's quota.
-    stmts.unlogSend.run(sendLogId);
+    await sql`DELETE FROM otp_sends WHERE id = ${sendLogId}`;
     throw err;
   }
 
-  const now = Date.now();
-  transaction(() => {
-    stmts.invalidateActive.run(now, email, purpose);
-    stmts.insertOtp.run(email, purpose, hash, payload ? JSON.stringify(payload) : null, now + ttlMs, now);
-  });
+  await sql.transaction([
+    sql`UPDATE otps SET consumed_at = now() WHERE email = ${email} AND purpose = ${purpose} AND consumed_at IS NULL`,
+    sql`
+      INSERT INTO otps (email, purpose, otp_hash, payload, expires_at)
+      VALUES (${email}, ${purpose}, ${hash}, ${payload ? JSON.stringify(payload) : null}::jsonb,
+              now() + make_interval(secs => ${ttlSec}))
+    `,
+    // Housekeeping piggy-backs on sends (no long-running process to schedule it).
+    sql`DELETE FROM otps WHERE expires_at < now() - interval '1 hour'`,
+    sql`DELETE FROM otp_sends WHERE sent_at < now() - interval '1 hour'`,
+  ]);
 
-  return {
-    expiresInSec: Math.round(ttlMs / 1000),
-    resendAfterSec: Math.round(resendCooldownMs / 1000),
-  };
+  return { expiresInSec: ttlSec, resendAfterSec: cooldownSec };
 }
 
 /**
@@ -123,19 +122,29 @@ export async function issueOtp({ email, purpose, payload = null, deliver }) {
  * describing the failure otherwise. A successful code is consumed.
  */
 export async function verifyOtp({ email, purpose, code }) {
-  const record = stmts.activeOtp.get(email, purpose);
+  const [record] = await sql`
+    SELECT id, otp_hash, payload, (expires_at <= now()) AS expired
+    FROM otps
+    WHERE email = ${email} AND purpose = ${purpose} AND consumed_at IS NULL
+    ORDER BY id DESC
+    LIMIT 1
+  `;
   if (!record) {
     throw new HttpError(400, 'OTP_NOT_FOUND', 'No active code for this email. Please request a new one.');
   }
 
-  const now = Date.now();
-  if (record.expires_at <= now) {
-    stmts.consume.run(now, record.id);
+  if (record.expired) {
+    await sql`UPDATE otps SET consumed_at = now() WHERE id = ${record.id}`;
     throw new HttpError(410, 'OTP_EXPIRED', 'This code has expired. Please request a new one.');
   }
 
-  // Atomically claim an attempt before the (async) comparison.
-  if (stmts.claimAttempt.run(record.id, maxAttempts).changes === 0) {
+  // Atomically claim an attempt before the (slow) bcrypt comparison.
+  const [claimed] = await sql`
+    UPDATE otps SET attempts = attempts + 1
+    WHERE id = ${record.id} AND attempts < ${maxAttempts} AND consumed_at IS NULL
+    RETURNING attempts
+  `;
+  if (!claimed) {
     throw new HttpError(429, 'OTP_LOCKED', 'Too many incorrect attempts. Please request a new code.', {
       attemptsRemaining: 0,
     });
@@ -144,10 +153,9 @@ export async function verifyOtp({ email, purpose, code }) {
   const matches = await bcrypt.compare(code, record.otp_hash);
 
   if (!matches) {
-    const { attempts } = stmts.attemptsOf.get(record.id);
-    const attemptsRemaining = Math.max(0, maxAttempts - attempts);
+    const attemptsRemaining = Math.max(0, maxAttempts - claimed.attempts);
     if (attemptsRemaining === 0) {
-      stmts.consume.run(Date.now(), record.id); // burn it — a new code is required
+      await sql`UPDATE otps SET consumed_at = now() WHERE id = ${record.id}`; // burn it
       throw new HttpError(429, 'OTP_LOCKED', 'Too many incorrect attempts. Please request a new code.', {
         attemptsRemaining: 0,
       });
@@ -161,9 +169,12 @@ export async function verifyOtp({ email, purpose, code }) {
   }
 
   // Single use: only one concurrent request can win this update.
-  if (stmts.consume.run(Date.now(), record.id).changes === 0) {
+  const [consumed] = await sql`
+    UPDATE otps SET consumed_at = now() WHERE id = ${record.id} AND consumed_at IS NULL RETURNING id
+  `;
+  if (!consumed) {
     throw new HttpError(400, 'OTP_NOT_FOUND', 'This code has already been used. Please request a new one.');
   }
 
-  return { payload: record.payload ? JSON.parse(record.payload) : null };
+  return { payload: record.payload };
 }

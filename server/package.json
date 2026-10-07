@@ -5,13 +5,15 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "dev": "node --watch --disable-warning=ExperimentalWarning src/index.js",
-    "start": "node --disable-warning=ExperimentalWarning src/index.js"
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "db:migrate": "node scripts/migrate.js"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": ">=20"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.2.0",
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
     "dotenv": "^18.0.6",

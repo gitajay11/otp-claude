@@ -2,7 +2,8 @@
   "name": "nexus-otp-auth",
   "version": "1.0.0",
   "private": true,
-  "description": "Passwordless email-OTP authentication (React + Express + SQLite)",
+  "type": "module",
+  "description": "Passwordless email-OTP authentication (React + Express + Postgres)",
   "workspaces": [
     "shared",
     "server",
@@ -11,10 +12,11 @@
   "scripts": {
     "dev": "concurrently -k -n server,client -c cyan,magenta \"npm run dev -w server\" \"npm run dev -w client\"",
     "build": "npm run build -w client",
-    "start": "npm start -w server"
+    "start": "npm start -w server",
+    "db:migrate": "npm run db:migrate -w server"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": "24.x"
   },
   "devDependencies": {
     "concurrently": "^10.0.5"

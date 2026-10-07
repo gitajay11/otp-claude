@@ -37,7 +37,7 @@ const emailExistsError = () =>
 router.post('/signup/send-otp', sendOtpIpLimiter, validate(signupSendSchema), async (req, res) => {
   const { firstName, lastName, email, country, mobile } = req.body;
 
-  if (users.findByEmail(email)) throw emailExistsError();
+  if (await users.findByEmail(email)) throw emailExistsError();
 
   // `mobile` is the normalised number from validation (national trunk prefix stripped).
   const payload = {
@@ -65,7 +65,7 @@ router.post('/signup/verify-otp', verifyOtpIpLimiter, validate(verifyOtpSchema),
 
   let user;
   try {
-    user = users.create({ ...payload, email });
+    user = await users.create({ ...payload, email });
   } catch (err) {
     if (isUniqueViolation(err)) throw emailExistsError(); // registered in the meantime
     throw err;
@@ -79,7 +79,7 @@ router.post('/signup/verify-otp', verifyOtpIpLimiter, validate(verifyOtpSchema),
 
 router.post('/login/send-otp', sendOtpIpLimiter, validate(emailOnlySchema), async (req, res) => {
   const { email } = req.body;
-  const user = users.findByEmail(email);
+  const user = await users.findByEmail(email);
   if (!user) {
     throw new HttpError(404, 'EMAIL_NOT_FOUND', 'No account found for this email. Would you like to sign up?', {
       fields: { email: 'No account found for this email.' },
@@ -99,10 +99,10 @@ router.post('/login/verify-otp', verifyOtpIpLimiter, validate(verifyOtpSchema), 
   const { email, otp } = req.body;
   await verifyOtp({ email, purpose: 'login', code: otp });
 
-  const existing = users.findByEmail(email);
+  const existing = await users.findByEmail(email);
   if (!existing) throw new HttpError(404, 'EMAIL_NOT_FOUND', 'No account found for this email.');
 
-  const user = users.touchLogin(existing.id);
+  const user = await users.touchLogin(existing.id);
   startSession(res, user.id);
   res.json({ message: 'Logged in.', user: toPublicUser(user) });
 });

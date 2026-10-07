@@ -71,20 +71,27 @@ export function endSession(res) {
 }
 
 /** Populates `req.user` from the session cookie or responds 401. */
-export function requireAuth(req, res, next) {
+export async function requireAuth(req, res, next) {
   const token = req.cookies?.[config.jwt.cookieName];
   if (!token) return next(new HttpError(401, 'UNAUTHENTICATED', 'You are not signed in.'));
 
-  try {
-    const { sub } = jwt.verify(token, config.jwt.secret, { issuer: config.jwt.issuer, algorithms: ['HS256'] });
-    const user = users.findById(Number(sub));
-    if (!user) throw new Error('user not found');
-    req.user = user;
-    next();
-  } catch {
+  const expired = () => {
     endSession(res);
-    next(new HttpError(401, 'UNAUTHENTICATED', 'Your session has expired. Please log in again.'));
+    return next(new HttpError(401, 'UNAUTHENTICATED', 'Your session has expired. Please log in again.'));
+  };
+
+  let sub;
+  try {
+    ({ sub } = jwt.verify(token, config.jwt.secret, { issuer: config.jwt.issuer, algorithms: ['HS256'] }));
+  } catch {
+    return expired();
   }
+
+  // Database errors propagate (500) rather than masquerading as a logout.
+  const user = await users.findById(Number(sub));
+  if (!user) return expired();
+  req.user = user;
+  next();
 }
 
 /* ------------------------------------------------------------------ */
