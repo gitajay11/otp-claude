@@ -3,3 +3,8 @@ client/dist/
 server/data/
 .env
 *.log
+.vercel
+
+.vercel
+.env*
+!.env.example
