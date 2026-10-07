@@ -1,0 +1,13 @@
+{
+  "name": "nexus-shared",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Validation rules shared by the client and the server",
+  "exports": {
+    "./phone": "./phone.js"
+  },
+  "dependencies": {
+    "libphonenumber-js": "^1.13.14"
+  }
+}
